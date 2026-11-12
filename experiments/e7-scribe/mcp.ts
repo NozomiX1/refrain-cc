@@ -21,11 +21,13 @@ const core = (cmd: string, args: unknown) =>
   JSON.parse(execFileSync("node", [`${root}core/cli.ts`, cmd], { input: JSON.stringify(args), encoding: "utf8", maxBuffer: 64 << 20 }));
 const here = { ccSessionId: process.env.E7_SESSION, cwd: process.env.E7_CWD };
 
+let looked = false; // one server per run, so this is the run's own
 function call(name: string, a: any): { text: string; isError?: boolean } {
+  if (name !== "submit") looked = true;
   if (name === "search") return { text: core("search", { ...here, args: { query: a.query, in: a.in, scope: a.scope, limit: a.limit } }).text };
   if (name === "read") return { text: core("read", { ...here, address: a.address, full: a.full }).text };
-  const { summaries, knowledge, project_state, session_state } = a;
-  const r = core("submit", { runId: Number(process.env.E7_RUN_ID), submission: { summaries, knowledge, project_state, session_state } });
+  const { summaries, knowledge, state, confirm } = a;
+  const r = core("submit", { runId: Number(process.env.E7_RUN_ID), looked, submission: { summaries, knowledge, state, confirm } });
   return r.ok ? { text: r.text } : { text: r.text, isError: true };
 }
 

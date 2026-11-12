@@ -1,5 +1,7 @@
 T1#E1 user 这个项目里提交说明有什么约定吗？不知道就说不知道。
-T1#E2 assistant tool_use 调用 Bash：git log --format='%H%n%s%n%b%n---' -n 20 2>&1; echo "=== status ==="; git status --short 2>&1; echo "=== ls ==="; ls -la 2>&1
+T1#E2 assistant tool_use 调用 Bash：
+command: git log --format='%H%n%s%n%b%n---' -n 20 2>&1; echo "=== status ==="; git status --short 2>&1; echo "=== ls ==="; ls -la 2>&1
+description: Inspect git history, status and top-level files
 T1#E3 observation tool_result Bash 成功，原始 0.5KB：f5b8cb5849a0f7c0c846eea5b96f6691951ce4c6
 init
 
@@ -13,7 +15,9 @@ drwxr-xr-x@  4 user  staff  128 Oct 26 02:35 . ……（中间省略 124 字符�
 -rw-r--r--@  1 user  staff   19 Oct 26 02:35 a.txt
 -rw-r--r--@  1 user  staff   15 Oct 26 02:35 b.txt
 -rw-r--r--@  1 user  staff   55 Oct 26 02:35 README.md
-T1#E4 assistant tool_use 调用 Bash：echo "=== commit template / hooks config ==="; git config --get commit.template 2>&1; git config --show-origin --get-all core.hooksPath 2>&1; ls -la .git/hooks 2>/dev/null | grep -v sample; echo "=== convention files ==="; find . -path ./.git -prune  ……（中间省略 322 字符）……  2>&1; echo "=== .claude ==="; ls -la .claude 2>&1
+T1#E4 assistant tool_use 调用 Bash：
+command: echo "=== commit template / hooks config ==="; git config --get commit.template 2>&1; git config --show-origin --get-all core.hooksPath 2>&1; ls -la . ……（中间省略 422 字符）……  2>&1; echo "=== .claude ==="; ls -la .claude 2>&1
+description: Look for commit config, hooks and convention docs
 T1#E5 observation tool_result Bash 成功，原始 0.4KB：=== commit template / hooks config ===
 total 128
 drwxr-xr-x@ 16 user  staff   512 Oct 26 02:35 .
@@ -25,7 +29,9 @@ total 8
 drwxr-xr-x@ 3 user  staff   96 Oct 26 02:35 .
 drwxr-xr-x@ 8 user  staff  256 Oct 26 02:35 ..
 -rw-r--r--@ 1 user  staff   90 Oct 26 02:35 settings.local.json
-T1#E6 assistant tool_use 调用 Bash：echo "=== README.md ==="; cat README.md; echo; echo "=== .claude/settings.local.json ==="; cat .claude/settings.local.json; echo; echo "=== local git config ==="; git config --local --list 2>&1
+T1#E6 assistant tool_use 调用 Bash：
+command: echo "=== README.md ==="; cat README.md; echo; echo "=== .claude/settings.local.json ==="; cat .claude/settings.local.json; echo; echo "=== local git config ==="; git config --local --list 2>&1
+description: Read README, local Claude settings and git config
 T1#E7 observation tool_result Bash 成功，原始 0.4KB：=== README.md ===
 # proj
 
@@ -46,7 +52,9 @@ core.bare=false
 core.logallrefupdates=true
 core.ignorecase=true
 core.precomposeunicode=true
-T1#E8 assistant tool_use 调用 Bash：git config --global --get commit.template 2>&1; echo "exit=$?"; git config --global --get-regexp '^(commit|core\.hooksPath|init)' 2>&1; echo "exit=$?"; cd /home/user/lab/memory/experiments/s2-fixtures/work/proj && git remote -v 2>&1; git branch -a 2>&1
+T1#E8 assistant tool_use 调用 Bash：
+command: git config --global --get commit.template 2>&1; echo "exit=$?"; git config --global --get-regexp '^(commit|core\.hooksPath|init)' 2>&1; echo "exit=$?" ……（中间省略 52 字符）…… ork/proj && git remote -v 2>&1; git branch -a 2>&1
+description: Check global git commit config, remotes and branches
 T1#E9 observation tool_result Bash 成功，原始 0.0KB：exit=1
 exit=1
 * main

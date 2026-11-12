@@ -4,15 +4,17 @@ import type { Register } from "claude-code";
 
 const CHECK_MS = 60000;
 
-type Turn = { turnEndedAt: string; contextTokens: number; cacheTtlMs: number; handoffTokens: number; idle: { enabled: boolean; minTokens: number } };
+type Turn = { turnEndedAt: string; contextTokens: number; cacheTtlMs: number; worth: boolean; idle: { enabled: boolean; minTokens: number } };
 
 let busy = false; // a main turn is running: never compact under it
 let compactedAfter = ""; // the turn end we already compacted after
 
 // The cache has expired, so the next request re-reads the whole context at full price anyway; swap it for the
-// handoff when the context is big enough to be worth it and the handoff is at most half of it (4.5).
-export function due(t: Turn, now: number): boolean {
-  return t.idle.enabled && now - Date.parse(t.turnEndedAt) > t.cacheTtlMs && t.contextTokens >= t.idle.minTokens && t.handoffTokens * 2 <= t.contextTokens;
+// handoff when the context is big enough and refrain finds the handoff clearly smaller (4.5). With its scribe
+// running or paused, ask anyway: refrain then leaves one line saying why it did not, which the person needs to know.
+export function due(t: Turn, state: string | undefined, now: number): boolean {
+  if (!t.idle.enabled || now - Date.parse(t.turnEndedAt) <= t.cacheTtlMs || t.contextTokens < t.idle.minTokens) return false;
+  return t.worth || state === "running" || state === "paused";
 }
 
 export const register: Register = (on) => {
@@ -22,13 +24,14 @@ export const register: Register = (on) => {
     const home = (await $.process.run(["sh", "-c", 'printf %s "${REFRAIN_HOME:-$HOME/.refrain}"'])).stdout;
     $.clock.every(CHECK_MS, async () => {
       if (busy) return;
-      let turn: Turn | undefined;
+      let status: { state?: string; turn?: Turn };
       try {
-        turn = JSON.parse(await $.fs.read(`${home}/status/${await $.session.id()}.json`)).turn;
+        status = JSON.parse(await $.fs.read(`${home}/status/${await $.session.id()}.json`));
       } catch {
         return; // refrain has not seen a turn of this session yet
       }
-      if (!turn || turn.turnEndedAt === compactedAfter || !due(turn, Date.now())) return;
+      const turn = status.turn;
+      if (!turn || turn.turnEndedAt === compactedAfter || !due(turn, status.state, Date.now())) return;
       compactedAfter = turn.turnEndedAt;
       await $.session.compact();
     });

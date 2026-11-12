@@ -25,7 +25,7 @@ test("keeps the user's words, replies and tool steps; drops injections", () => {
   t.say("README 只有一行。");
   assert.deepEqual(brief(t), [
     "user* 看一下 README",
-    "assistant 调用 Read：/x/README.md",
+    "assistant 调用 Read：\nfile_path: /x/README.md",
     "observation Read 成功，原始 0.0KB：# hello",
     "assistant README 只有一行。",
   ]);
@@ -48,7 +48,7 @@ test("only a rejection by the user counts as the user's; classifier blocks are t
   t.interrupt();
   assert.deepEqual(brief(t).slice(2), [
     "user 〔拒绝了上面的工具调用〕",
-    "assistant 调用 Bash：rm -rf tmp2",
+    "assistant 调用 Bash：\ncommand: rm -rf tmp2",
     "observation Bash 失败，原始 0.0KB：Error: Permission for this action was denied",
     "user 〔打断〕",
   ]);
@@ -62,7 +62,7 @@ test("parallel tool results are kept although only the last one is on the parent
   t.result("c1", "A", {}, a1);
   t.result("c2", "B", {}, a2);
   t.say("都读完了");
-  assert.deepEqual(brief(t), ["user* 读两个文件", "assistant 调用 Read：a", "assistant 调用 Read：b", "observation Read 成功，原始 0.0KB：A", "observation Read 成功，原始 0.0KB：B", "assistant 都读完了"]);
+  assert.deepEqual(brief(t), ["user* 读两个文件", "assistant 调用 Read：\nfile_path: a", "assistant 调用 Read：\nfile_path: b", "observation Read 成功，原始 0.0KB：A", "observation Read 成功，原始 0.0KB：B", "assistant 都读完了"]);
 });
 
 test("a rewind drops the abandoned branch", () => {
@@ -116,6 +116,16 @@ test("long text is clipped at both ends with the omitted size", () => {
   const obs = read(t).entries[2];
   assert.equal(obs.rawChars, 5000);
   assert.match(obs.text, /（中间省略 4600 字符）/);
+});
+
+test("a tool call shows every field, each value clipped alike", () => {
+  const t = transcript();
+  t.human("改一下");
+  t.call("c1", "Edit", { file_path: "a.md", old_string: "旧".repeat(500), new_string: "新", replace_all: false });
+  t.call("c2", "Bash", { command: "ls", description: "List files" });
+  const [edit, bash] = read(t).entries.slice(1).map((e) => e.text);
+  assert.equal(edit, `调用 Edit：\nfile_path: a.md\nold_string: ${"旧".repeat(150)} ……（中间省略 300 字符）…… ${"旧".repeat(50)}\nnew_string: 新\nreplace_all: false`);
+  assert.equal(bash, "调用 Bash：\ncommand: ls\ndescription: List files");
 });
 
 test("without any origin field, falls back to plain user text and warns", () => {

@@ -42,8 +42,20 @@ export function resume(db: DatabaseSync, sessionId: number): void {
 
 export type State = "idle" | "running" | "paused";
 
-// What refrain-timer needs to decide on an idle compaction (4.5), written at every main turn's end.
-export type TurnInfo = { turnEndedAt: string; contextTokens: number; cacheTtlMs: number; handoffTokens: number; idle: { enabled: boolean; minTokens: number } };
+// What refrain-timer needs to decide on an idle compaction (4.5), written at every main turn's end and again when a
+// scribe run ends (worth and the pending part change then). pendingTurns/pendingTokens: not yet processed, for the status line.
+export type TurnInfo = { turnEndedAt: string; contextTokens: number; cacheTtlMs: number; handoffTokens: number; worth: boolean;
+  pendingTurns: number; pendingTokens: number; idle: { enabled: boolean; minTokens: number } };
+
+// The turn part of a session's status file, if a main turn has ended yet.
+export function statusTurn(db: DatabaseSync, home: string, sessionId: number): TurnInfo | undefined {
+  const s = db.prepare("SELECT cc_session_id AS id FROM sessions WHERE id = ?").get(sessionId) as { id: string } | undefined;
+  try {
+    return s && JSON.parse(readFileSync(join(home, "status", `${s.id}.json`), "utf8")).turn;
+  } catch {
+    return undefined;
+  }
+}
 
 // status/<CC session id>.json: read by the status line script once a second (7.11) and by refrain-timer.
 // A field left out keeps its last value.

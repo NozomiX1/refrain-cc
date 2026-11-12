@@ -3,13 +3,13 @@
 import { writeFileSync } from "node:fs";
 import type { Row } from "../core/transcript.ts";
 
-export function transcript() {
+export function transcript(prefix = "u") {
   const rows: Omit<Row, "line">[] = [];
   let n = 0;
   let clock = Date.parse("2026-10-01T00:00:00Z");
   let last: string | null = null;
   const add = (r: Omit<Row, "line">, parent: string | null = last) => {
-    const row = { uuid: `u${++n}`, parentUuid: parent, timestamp: new Date((clock += 1000)).toISOString(), ...r };
+    const row = { uuid: `${prefix}${++n}`, parentUuid: parent, timestamp: new Date((clock += 1000)).toISOString(), ...r };
     rows.push(row);
     last = row.uuid;
     return row.uuid;
@@ -40,7 +40,7 @@ export function transcript() {
       for (const u of keptUuids) {
         const orig = rows.find((r) => r.uuid === u)!;
         const { uuid: _u, parentUuid: _p, ...copy } = orig;
-        const row = { ...copy, uuid: `u${++n}`, parentUuid: last };
+        const row = { ...copy, uuid: `${prefix}${++n}`, parentUuid: last };
         rows.push(row);
         last = row.uuid;
       }

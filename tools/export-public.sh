@@ -11,9 +11,11 @@ shift
 root=$(git rev-parse --show-toplevel)
 mkdir -p "$out"
 git -C "$root" archive HEAD | tar -x -C "$out"
-for f in docs/log.md docs/archive/memory-plugin.md docs/archive/ai-native-game.md docs/research/transcript-annotation.md; do
+for f in docs/log.md docs/assessment.md docs/archive/memory-plugin.md docs/archive/ai-native-game.md docs/research/transcript-annotation.md; do
   printf '%s\n' "这份文件只留在作者本机，不公开：里面是作者的个人情况或真实对话的内容。" > "$out/$f"
 done
+# Plans for the author's next project, not about this plugin; nothing public links to them.
+rm "$out/docs/harness-kickoff.md" "$out/docs/research/h-harness-landscape.md"
 # A home path or an email address other than the placeholders, or any word given, stops the export.
 if grep -rnIE "/Users/[A-Za-z]|/home/[a-z]+/|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[a-z]{2,}" "$out" | grep -vE "/home/user/|user@example\.com|dev@example\.com|t@example\.com|noreply@anthropic\.com"; then
   echo "found the lines above; fix them before publishing" >&2; exit 1

@@ -1,29 +1,46 @@
 // The scribe's submit: validation with a readable receipt, then writes (design.md 6.5).
 import type { DatabaseSync } from "node:sqlite";
 import { address, type Numbered } from "./db.ts";
-import { currentKnowledge, localDate, stateItems, type Knowledge, type StateItem } from "./render.ts";
+import { currentKnowledge, currentState, localDate, TOKENS_PER_CHAR, type Knowledge, type StateItem } from "./render.ts";
 
-export const LIMITS = { knowledge: 400, summary: 600, attempts: 3 }; // characters; E6 may tune
+// knowledge and summary in characters (E6 may tune); state in items, a guard against runaway growth (E8: 9 → 32)
+// well above the prompt's "about ten", so real todos are not squeezed out.
+export const LIMITS = { knowledge: 400, summary: 600, attempts: 3, state: 20 };
 
 type Op = {
   op?: string; id?: string; code?: string; scope?: string; category?: string; about_me?: boolean; epistemic?: string; pending?: boolean;
   body?: string; refs?: string[]; reason?: string;
 };
-type StateSub = { items?: Array<{ from?: number; type?: string; content?: string; condition?: string | null; refs?: string[] }>; closed?: Array<{ no?: number; outcome?: string; reason?: string; to?: string }> };
+type StateOp = { op?: string; no?: number; type?: string; body?: string; condition?: string | null; refs?: string[]; outcome?: string; reason?: string; to?: string };
 export type Submission = {
   summaries?: Array<{ title?: string; tags?: string[]; body?: string; refs?: string[] }>;
   knowledge?: Op[];
-  project_state?: StateSub | null;
-  session_state?: StateSub | null;
+  state?: StateOp[] | null;
 };
 export type Ctx = { db: DatabaseSync; sessionId: number; projectId: number | null; batch: Numbered[]; today: string };
 
 const ADDR = /^S(\d+)\/T(\d+)#E(\d+)$/;
 const TEMP = /^new\w*$/;
 const CODE = /^K\d+$/;
-const TYPES = ["phase", "progress", "todo", "verify", "authorization", "instruction"];
+const TYPES = ["phase", "progress", "todo", "verify", "instruction"];
 const isStr = (x: unknown): x is string => typeof x === "string" && x.trim() !== "";
 const strip = (r: string) => r.trim().replace(/\s*@(user|assistant|observation)$/, "");
+const opening = (t: unknown) => (isStr(t) ? `"${t.length > 30 ? t.slice(0, 30) + "…" : t}"` : "");
+// Receipts name an item by what the scribe wrote (code or number, then its opening words); a 0-based position read as a
+// second numbering, so a position appears only when nothing was written or two names come out the same.
+function names(key: string, list: unknown, what: (x: any) => [unknown, ...string[]]): string[] {
+  const base = (Array.isArray(list) ? list : []).map((x) => {
+    const [op, ...ids] = what(x ?? {});
+    const id = ids.filter(Boolean).join(" ");
+    return { op: typeof op === "string" ? op : "", id, both: [typeof op === "string" ? op : "", id].filter(Boolean).join(" ") };
+  });
+  return base.map(({ op, id, both }, i) => {
+    const pos = `你交的第 ${i + 1} 个`;
+    return `${key}（${!id ? [op, pos].filter(Boolean).join("，") : base.filter((b) => b.both === both).length > 1 ? `${both}，${pos}` : both}）`;
+  });
+}
+const twice = (seen: Map<string, string[]>, say: (x: string, ops: string[]) => string) =>
+  [...seen].filter(([, ops]) => ops.length > 1).map(([x, ops]) => say(x, ops));
 
 type Ref = { role: string; ts: string };
 
@@ -47,18 +64,18 @@ export function validate(ctx: Ctx, s: Submission): string[] {
   if (typeof s !== "object" || s == null) return ["提交的内容不是一个 JSON 对象。"];
   for (const key of ["summaries", "knowledge"] as const)
     if (!Array.isArray(s[key])) errs.push(`缺少 ${key}，没有内容也要交空列表 []。`);
-  for (const key of ["project_state", "session_state"] as const)
-    if (!(key in s)) errs.push(`缺少 ${key}，没有变化就交 null。`);
+  if (!("state" in s)) errs.push("缺少 state，没有变化就交 null。");
   // A blank submit was the scribe skipping its input (E7: twice, on 24k and 61k-char batches), never an empty batch.
   if (Array.isArray(s.summaries) && !s.summaries.length)
     errs.push("summaries 是空的。每次至少写一份摘要，对话再短也用一两句概括。要处理的对话在输入最后的「# 这次要处理的对话」一节，每次都有内容。");
   const ops = Array.isArray(s.knowledge) ? s.knowledge : [];
 
+  const kNames = names("knowledge", ops, (o) => [o.op, o.op !== "create" && isStr(o.code) ? o.code : "", o.op === "create" && isStr(o.id) ? o.id : "", opening(o.body)]);
   const temps = new Map<string, number>();
   ops.forEach((o, i) => {
     if (o?.op === "create" && o.id !== undefined) {
-      if (!isStr(o.id) || !TEMP.test(o.id)) errs.push(`knowledge[${i}]（create）：临时标签要写成 new1、new2 这样。`);
-      else if (temps.has(o.id)) errs.push(`knowledge[${i}]（create）：临时标签 ${o.id} 重复了。`);
+      if (!isStr(o.id) || !TEMP.test(o.id)) errs.push(`${kNames[i]}：临时标签要写成 new1、new2 这样。`);
+      else if (temps.has(o.id)) errs.push(`${kNames[i]}：临时标签 ${o.id} 前面已经用过了，同一次提交里每个标签只能用一次。`);
       else temps.set(o.id, i);
     }
   });
@@ -90,8 +107,9 @@ export function validate(ctx: Ctx, s: Submission): string[] {
     return roles;
   };
 
+  const sNames = names("summaries", s.summaries, (m) => [undefined, opening(m.title) || opening(m.body)]);
   (Array.isArray(s.summaries) ? s.summaries : []).forEach((m, i) => {
-    const w = `summaries[${i}]`;
+    const w = sNames[i];
     if (!isStr(m?.title)) errs.push(`${w}：缺少 title。`);
     if (!isStr(m?.body)) errs.push(`${w}：缺少 body。`);
     else if (m.body.length > LIMITS.summary) errs.push(`${w}：正文 ${m.body.length} 字，超过上限 ${LIMITS.summary} 字。内容多就拆成几份按话题切开的摘要。`);
@@ -99,14 +117,11 @@ export function validate(ctx: Ctx, s: Submission): string[] {
     checkRefs(w, m?.refs, { batchOnly: true });
   });
 
-  const touched = new Set<string>();
+  const touched = new Map<string, string[]>();
   ops.forEach((o, i) => {
-    const w = `knowledge[${i}]（${o?.op ?? "?"}${o?.code ? " " + o.code : ""}）`;
-    if (isStr(o?.code) && o.op !== "create") {
-      if (touched.has(o.code)) errs.push(`${w}：${o.code} 在这次提交里出现了不止一次。一个编号只能有一个操作。`);
-      touched.add(o.code);
-    }
-    if (!["create", "update", "archive"].includes(o?.op ?? "")) return errs.push(`knowledge[${i}]：op 只能是 create、update 或 archive。`);
+    const w = kNames[i];
+    if (isStr(o?.code) && o.op !== "create") touched.set(o.code, [...(touched.get(o.code) ?? []), String(o.op)]);
+    if (!["create", "update", "archive"].includes(o?.op ?? "")) return errs.push(`${w}：op 只能是 create、update 或 archive。`);
     let prev: Knowledge | undefined;
     if (o.op !== "create") {
       prev = isStr(o.code) ? known.get(o.code) : undefined;
@@ -116,7 +131,9 @@ export function validate(ctx: Ctx, s: Submission): string[] {
     }
     if (o.op !== "archive") {
       if (!isStr(o.body)) errs.push(`${w}：缺少 body。`);
-      else if (o.body.length > LIMITS.knowledge) errs.push(`${w}：正文 ${o.body.length} 字，超过上限 ${LIMITS.knowledge} 字。`);
+      // E9 B: what grows is lists and quotes, so the receipt says how much to cut and what to cut first.
+      else if (o.body.length > LIMITS.knowledge)
+        errs.push(`${w}：正文 ${o.body.length} 字，超过上限 ${LIMITS.knowledge} 字，至少要删掉 ${o.body.length - LIMITS.knowledge} 字。一条知识只写结论；文档、来源这类清单只写去哪看，不逐个列；原话最多留一两句，优先留最新的，更早的出处会自动保留。`);
     }
     if (!isStr(o.reason)) errs.push(`${w}：缺少 reason。`);
     if (o.op === "create") {
@@ -138,49 +155,60 @@ export function validate(ctx: Ctx, s: Submission): string[] {
       errs.push(`${w}：观察（observed）不能是规则：只有用户本人的话能变成"以后要这样做"。`);
   });
 
-  const state = (key: "project_state" | "session_state", prevItems: StateItem[]) => {
-    const st = s[key];
+  errs.push(...twice(touched, (code, list) => `knowledge：${code} 写了 ${list.length} 次（${list.join("、")}）。一个编号只能有一个操作。`));
+
+  const state = (prevItems: StateItem[]) => {
+    const key = "state";
+    const st = s.state;
     if (st == null) return;
-    if (key === "project_state" && ctx.projectId == null) return errs.push(`project_state：这个会话不属于任何项目，要交 null。`);
-    if (!Array.isArray(st.items)) return errs.push(`${key}：有变化时要交完整的 items 列表；没变化就交 null。`);
-    const closed = Array.isArray(st.closed) ? st.closed : [];
-    const seen = new Map<number, string>();
-    const claim = (no: unknown, by: string) => {
-      if (typeof no !== "number" || !Number.isInteger(no) || no < 1 || no > prevItems.length) return errs.push(`${key}：${by} 指向的第 ${no} 项不存在（上一版共 ${prevItems.length} 项）。`);
-      if (seen.has(no)) return errs.push(`${key}：上一版第 ${no} 项被交代了两次（${seen.get(no)}、${by}）。`);
-      seen.set(no, by);
-    };
-    st.items.forEach((it, i) => {
-      const w = `${key}.items[${i}]`;
-      if (it?.from !== undefined) claim(it.from, `items[${i}] 的 from`);
-      const kept = it?.from !== undefined && Object.keys(it).length === 1;
-      if (kept) return;
-      const prev = typeof it?.from === "number" ? prevItems[it.from - 1] : undefined;
-      const type = it?.type ?? prev?.type;
+    if (!Array.isArray(st)) return errs.push(`${key}：有变化时交一个操作列表（keep、update、close、create）；没变化就交 null。`);
+    const kept = st.filter((o) => o?.op !== "close").length;
+    if (kept > LIMITS.state)
+      errs.push(`state：交完后有 ${kept} 项，最多 ${LIMITS.state} 项。合并同一件事的几项，结束已经做完或已经过时的，不卡住接下来工作的待核实留在摘要里就够了。`);
+    const phases = st.filter((o) => o?.op !== "close" && (o?.type ?? (typeof o?.no === "number" ? prevItems[o.no - 1]?.type : undefined)) === "phase").length;
+    if (phases && ctx.projectId == null) errs.push("state：这个会话不属于任何项目，没有阶段（phase）；正在做的事用 progress。");
+    else if (phases > 1) errs.push(`state：交完后有 ${phases} 项阶段（phase），阶段只能有一项：项目整体到哪了合成一项写；某件具体的事正在做，用 progress。`);
+    const seen = new Map<string, string[]>();
+    const stNames = names(key, st, (o) => [o.op, o.op !== "create" && o.no !== undefined ? `第 ${o.no} 项` : "", opening(o.body)]);
+    st.forEach((o, i) => {
+      const w = stNames[i];
+      if (!["keep", "update", "close", "create"].includes(o?.op ?? "")) return errs.push(`${w}：op 只能是 keep、update、close 或 create。结束一项（完成、放弃、升级）都用 close，在 outcome 里写是哪种。`);
+      let prev: StateItem | undefined;
+      if (o.op === "create") {
+        if (o.no !== undefined) return errs.push(`${w}：create 不带 no。改上一版的某一项，即使内容几乎全换了，也用 update。`);
+      } else {
+        if (typeof o.no !== "number" || !Number.isInteger(o.no) || o.no < 1 || o.no > prevItems.length)
+          return errs.push(o.no === undefined ? `${w}：${o.op} 要写 no，就是上一版的序号。` : `${w}：上一版没有第 ${o.no} 项（共 ${prevItems.length} 项）。`);
+        seen.set(String(o.no), [...(seen.get(String(o.no)) ?? []), String(o.op)]);
+        prev = prevItems[o.no - 1];
+      }
+      if (o.op === "keep") {
+        if (Object.keys(o).some((f) => f !== "op" && f !== "no")) errs.push(`${w}：keep 只写 op 和 no；要改内容用 update。`);
+        return;
+      }
+      if (o.op === "close") {
+        if (!["done", "abandoned", "promoted"].includes(o.outcome ?? "")) errs.push(`${w}：outcome 只能是 done、abandoned 或 promoted。`);
+        if (o.outcome === "abandoned" && !isStr(o.reason)) errs.push(`${w}：放弃（abandoned）要写 reason。`);
+        if (o.outcome === "promoted" && !(isStr(o.to) && (known.has(o.to) || temps.has(o.to)))) errs.push(`${w}：升级（promoted）要写 to：一个已有的编号，或者这次新建条目的临时标签。`);
+        return;
+      }
+      const type = o.type ?? prev?.type;
       if (!type || !TYPES.includes(type)) errs.push(`${w}：type 只能是 ${TYPES.join("、")} 之一。`);
-      if (!isStr(it?.content)) errs.push(`${w}：新增或修改的项要写 content。`);
-      if (type === "authorization" || type === "instruction") {
-        if (key === "project_state") errs.push(`${w}：授权和临时指令只能放在本会话现状里；要长期有效的，写成规则类知识。`);
-        if (!checkRefs(w, it?.refs).includes("user")) errs.push(`${w}：授权和临时指令的 refs 里要有一条是用户本人的话（@user）。`);
-      } else if (it?.refs !== undefined) checkRefs(w, it.refs);
+      if (!isStr(o.body)) errs.push(`${w}：缺少 body。`);
+      if (type === "instruction") {
+        if (!checkRefs(w, o.refs ?? prev?.refs).includes("user")) errs.push(`${w}：用户的临时要求的 refs 里要有一条是用户本人的话（@user）。`);
+      } else if (o.refs !== undefined) checkRefs(w, o.refs);
     });
-    closed.forEach((c, i) => {
-      const w = `${key}.closed[${i}]`;
-      claim(c?.no, `closed[${i}]`);
-      if (!["done", "abandoned", "promoted"].includes(c?.outcome ?? "")) errs.push(`${w}：outcome 只能是 done、abandoned 或 promoted。`);
-      if (c?.outcome === "abandoned" && !isStr(c.reason)) errs.push(`${w}：放弃（abandoned）要写 reason。`);
-      if (c?.outcome === "promoted" && !(isStr(c.to) && (known.has(c.to) || temps.has(c.to)))) errs.push(`${w}：升级（promoted）要写 to：一个已有的编号，或者这次新建条目的临时标签。`);
-    });
+    errs.push(...twice(seen, (no, list) => `${key}：第 ${no} 项写了 ${list.length} 次（${list.join("、")}）。一项只能写一次。`));
     prevItems.forEach((p, i) => {
-      if (!seen.has(i + 1)) errs.push(`${key}：上一版第 ${i + 1} 项（"${p.content.slice(0, 30)}"）既没有被 from 引用，也不在 closed 里。每一项都要交代去向。`);
+      if (!seen.has(String(i + 1))) errs.push(`${key}：上一版第 ${i + 1} 项（"${p.content.slice(0, 30)}"）这次没有写。每一项都要用 keep、update 或 close 写一次。`);
     });
   };
-  state("project_state", stateItems(ctx.db, "project", ctx.projectId));
-  state("session_state", stateItems(ctx.db, "session", ctx.sessionId));
+  state(currentState(ctx.db, ctx.projectId, ctx.sessionId).items);
   return errs;
 }
 
-const tokens = (s: string) => Math.ceil(s.length * 0.65); // shortcut: chars-based estimate (zh/en mix); use a tokenizer if budgets get tight
+const tokens = (s: string) => Math.ceil(s.length * TOKENS_PER_CHAR); // shortcut: chars-based estimate; use a tokenizer if budgets get tight
 
 // Writes a validated submission. Runs inside finishRun's transaction, after the batch's entries are inserted.
 export function apply(ctx: Ctx, s: Submission, runId: number, entryIds: Map<string, number>): string {
@@ -240,27 +268,30 @@ export function apply(ctx: Ctx, s: Submission, runId: number, entryIds: Map<stri
   }
 
   const insState = db.prepare("INSERT INTO states (kind, project_id, session_id, items, closed, run_id) VALUES (?, ?, ?, ?, ?, ?)");
-  const states: string[] = [];
-  for (const [key, kind, id] of [["project_state", "project", ctx.projectId], ["session_state", "session", ctx.sessionId]] as const) {
-    const st = s[key];
-    if (st == null || id == null) {
-      states.push(`${kind === "project" ? "项目现状" : "本会话现状"}没有变化`);
-      continue;
+  let stateNote = "现状没有变化";
+  if (s.state != null) {
+    const { items: prev, others } = currentState(db, ctx.projectId, ctx.sessionId);
+    const items: StateItem[] = [];
+    const closed: object[] = [];
+    // Fields an update leaves out stay as they were, like knowledge; the date moves only when the text does.
+    for (const o of s.state) {
+      const p = o.no ? prev[o.no - 1] : undefined;
+      if (o.op === "keep") items.push(p!);
+      else if (o.op === "close") closed.push({ no: o.no, outcome: o.outcome, reason: o.reason, to: o.to ? real(o.to) : undefined });
+      else {
+        const type = o.type ?? p!.type;
+        items.push({ type, content: o.body!, condition: "condition" in o ? o.condition ?? null : p?.condition ?? null,
+          refs: o.refs?.map(strip) ?? p?.refs, as_of: p && p.content === o.body ? p.as_of : ctx.today, ...(type === "instruction" ? { session: ctx.sessionId } : {}) });
+      }
     }
-    const prev = stateItems(db, kind, id);
-    const items: StateItem[] = st.items!.map((it) => {
-      const p = it.from ? prev[it.from - 1] : undefined;
-      if (p && Object.keys(it).length === 1) return p;
-      const content = it.content!;
-      return { type: it.type ?? p!.type, content, condition: it.condition ?? null, refs: it.refs?.map(strip),
-        as_of: p && p.content === content ? p.as_of : ctx.today };
-    });
-    const closed = (st.closed ?? []).map((c) => ({ ...c, to: c.to ? real(c.to) : undefined }));
-    insState.run(kind, kind === "project" ? id : null, kind === "session" ? id : null, JSON.stringify(items), JSON.stringify(closed), runId);
-    states.push(`${kind === "project" ? "项目现状" : "本会话现状"}已更新`);
+    // Another session's temporary requests ride along unseen, for when that session comes back.
+    items.push(...others);
+    const project = ctx.projectId != null;
+    insState.run(project ? "project" : "session", project ? ctx.projectId : null, project ? null : ctx.sessionId, JSON.stringify(items), JSON.stringify(closed), runId);
+    stateNote = "现状已更新";
   }
   const k = Object.entries(count).filter(([, n]) => n).map(([op, n]) => `${{ create: "新建", update: "更新", archive: "归档" }[op]} ${n} 条`);
-  return `已保存：${sums.length} 份摘要，${k.length ? "知识" + k.join("、") : "知识没有变化"}，${states.join("，")}。这次整理完成，不用再回复。`;
+  return `已保存：${sums.length} 份摘要，${k.length ? "知识" + k.join("、") : "知识没有变化"}，${stateNote}。这次整理完成，不用再回复。`;
 }
 
 export function rejection(errs: string[], attemptsLeft: number): string {

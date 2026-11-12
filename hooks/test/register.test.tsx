@@ -35,11 +35,11 @@ function engine(on: any, table: Core = {}) {
 
 const start = ($: any) => $.session.start({ cwd: '/home/user/proj', surface: 'terminal', isInteractive: true })
 
-test('the scribe is registered on Haiku at low effort, with only refrain\'s three tools', async ($: any, on: any) => {
+test('the scribe is registered on Haiku at high effort, with only refrain\'s three tools', async ($: any, on: any) => {
   const { agents } = engine(on)
   await start($)
   expect(agents.length).toBe(1)
-  expect(agents[0]).toMatchObject({ name: 'scribe', model: 'haiku', effort: 'low', omitClaudeMd: true, background: true, prompt: 'you are the scribe' })
+  expect(agents[0]).toMatchObject({ name: 'scribe', model: 'haiku', effort: 'high', omitClaudeMd: true, background: true, prompt: 'you are the scribe' })
   expect(agents[0].tools).toEqual(['mcp__refrain__search', 'mcp__refrain__read', 'mcp__refrain__submit'])
 })
 
@@ -64,8 +64,31 @@ test('compaction: auto and idle are refused, precompute skipped, a subagent left
   expect((await $.session.compact({ trigger: 'manual', agentId: 'a9', messages: MESSAGES })).messages[0].text).toBe('CC native summary')
   const ours = await $.session.compact({ trigger: 'manual', messages: MESSAGES, instructions: '重点保留' })
   expect(ours.messages.map((m: any) => m.text)).toEqual(['HANDOFF', 'tail starts here', 'last answer'])
-  handoff = { status: 'native', reason: 'the handoff would be more than half the context' }
+  // The person's messages keep their handle; replies and tool results go back without one, so CC rebuilds them (e11).
+  const tail = [{ ...msg('user', 'tail starts here'), handle: 'h1' }, { ...msg('assistant', 'reading'), toolUses: [{ tool_use_id: 't1', tool: 'Read', input: {} }], handle: 'h2' },
+    { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 't1', text: 'file', isError: false }], handle: 'h3' }, { ...msg('assistant', ''), handle: 'h5' }, { ...msg('assistant', 'done'), handle: 'h4' }]
+  const kept = (await $.session.compact({ trigger: 'manual', messages: [...MESSAGES.slice(0, 2), ...tail] })).messages
+  expect(kept.map((m: any) => m.handle)).toEqual([undefined, 'h1', undefined, undefined, undefined])
+  expect(kept[2].toolUses[0].tool_use_id).toBe('t1')
+  expect(kept[3].toolResults[0].text).toBe('file')
+  handoff = { status: 'skip', notice: 'refrain：暂不压缩。压缩后上下文不会明显减少。' }
+  expect(await $.session.compact({ trigger: 'manual', messages: MESSAGES })).toEqual({ skip: 'refrain：暂不压缩。压缩后上下文不会明显减少。' })
+  handoff = { status: 'native', reason: 'no user message to keep' }
   expect((await $.session.compact({ trigger: 'manual', messages: MESSAGES })).messages[0].text).toBe('CC native summary')
+})
+
+test('an idle compaction leaves its line once the compacted conversation starts, and only once', async ($: any, on: any) => {
+  engine(on, { handoff: () => ({ status: 'ok', text: 'HANDOFF', tail: { turns: 1, firstText: 'tail starts here' }, notice: 'refrain：已自动压缩' }), briefing: () => ({ text: '' }) })
+  const lines: string[] = []
+  on('ui.log', (_: any, e: any) => (lines.push(e.text), { value: undefined }))
+  on('classic.SessionStart', () => ({}))
+  on('session.compact', () => ({ messages: [] }))
+  await start($)
+  await $.session.compact({ trigger: 'plugin', messages: MESSAGES })
+  expect(lines).toEqual([])
+  await $.classic.SessionStart({ source: 'compact' })
+  await $.classic.SessionStart({ source: 'compact' })
+  expect(lines).toEqual(['refrain：已自动压缩'])
 })
 
 const ended = (agentId?: string) => ({ turnId: 't1', answer: '', durationMs: 1, isAborted: false, reason: 'answer', ...(agentId && { agentId }) })
@@ -93,7 +116,7 @@ test('a main turn asks for the scribe; one that does not start fails its run; th
   expect(of('prepare').length).toBe(1)
   expect(of('finish').length).toBe(1)
 
-  const submission = { summaries: [], knowledge: [], project_state: null, session_state: null }
+  const submission = { summaries: [], knowledge: [], state: null }
   expect((await $.tool.call({ tool: 'mcp__refrain__submit', ...submission })).deny).toBe('submit is not for you')
   expect((await $.tool.call({ tool: 'mcp__refrain__submit', agentId: 'a9', ...submission })).deny).toBe('submit is not for you')
   expect(of('submit')).toEqual([])

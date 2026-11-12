@@ -20,35 +20,52 @@ const addr = (e: Entry) => `S${e.session_id}/T${e.turn_no}#E${e.entry_no}`;
 const projectName = (db: DatabaseSync, id: number | null) =>
   id == null ? "无项目" : basename((db.prepare("SELECT path FROM projects WHERE id = ?").get(id) as { path: string } | undefined)?.path ?? "?");
 
-// "a|b c" -> [["a","b"],["c"]]: every group must match, any word of a group will do.
-function parseQuery(q: string): string[][] {
-  return q.trim().split(/\s+/).map((t) => t.split("|").filter(Boolean)).filter((g) => g.length);
+// The query is plain words, split here (E10): Latin letters and digits by word, Chinese into overlapping two-character
+// pieces, so "之前那台阿里云服务器" finds 阿里云服务器 however it is spaced. The model used to write a small syntax
+// (space = all of, | = any of) and slipped on it: "阿里云 | 退订" became two required words, "C 方案|方案 C" split a phrase.
+export function terms(q: string): string[] {
+  const out: string[] = [];
+  for (const m of q.toLowerCase().matchAll(/[a-z0-9][a-z0-9_.\-\/#@]*|[\p{Script=Han}]+/gu)) {
+    const w = m[0].replace(/[._\-\/#@]+$/, "");
+    if (!/\p{Script=Han}/u.test(w)) out.push(w);
+    else if (w.length === 1) out.push(w);
+    else for (let i = 0; i + 1 < w.length; i++) out.push(w.slice(i, i + 2));
+  }
+  return [...new Set(out)];
 }
 
-// Groups whose words are all 3+ characters go through the trigram index (ranked by bm25); shorter ones fall back to LIKE (4.7).
-function match(groups: string[][], column: string, fts: { table: string; key: string } | null) {
-  const long = fts ? groups.filter((g) => g.every((w) => [...w].length >= 3)) : [];
-  const short = groups.filter((g) => !long.includes(g));
-  const where: string[] = [];
-  const params: string[] = [];
-  let rank = "NULL";
-  if (long.length && fts) {
-    const expr = long.map((g) => `(${g.map((w) => `"${w.replaceAll('"', '""')}"`).join(" OR ")})`).join(" AND ");
-    where.push(`${fts.key} IN (SELECT rowid FROM ${fts.table} WHERE ${fts.table} MATCH ?)`);
-    params.push(expr);
-    rank = `(SELECT bm25(${fts.table}) FROM ${fts.table} WHERE ${fts.table} MATCH ? AND rowid = ${fts.key})`;
-  }
-  for (const g of short) {
-    where.push(`(${g.map(() => `${column} LIKE ?`).join(" OR ")})`);
-    params.push(...g.map((w) => `%${w}%`));
-  }
-  const rankParams = rank === "NULL" ? [] : [params[0]];
-  return { where: where.length ? where.join(" AND ") : "1", params, rank, rankParams };
+// Substring match ranked here by BM25 (k1 1.2, b 0.75) over the query's terms, ties newest first (the caller's order).
+// The trigram index could not see two-character words, which most Chinese words are, so those queries came back newest
+// first with no notion of relevance. A row with more of the terms, and rarer ones, ranks higher; one with only some
+// still comes back.
+// shortcut: scans every matching row in code (E10: 17k entries, 4.3M chars, under 50 ms); index bigrams if projects get much bigger.
+type Ranked<T> = { row: T; score: number };
+export function rank<T>(rows: T[], text: (r: T) => string, words: string[], total: number): Ranked<T>[] {
+  const texts = rows.map((r) => text(r).toLowerCase());
+  const count = (t: string, w: string) => t.split(w).length - 1;
+  const df = new Map(words.map((w) => [w, texts.filter((t) => t.includes(w)).length]));
+  const avg = texts.reduce((n, t) => n + t.length, 0) / Math.max(1, texts.length);
+  const bm25 = (t: string, w: string) => {
+    const tf = count(t, w);
+    if (!tf) return 0;
+    const idf = Math.log(1 + (total - df.get(w)! + 0.5) / (df.get(w)! + 0.5));
+    return (idf * tf * 2.2) / (tf + 1.2 * (0.25 + (0.75 * t.length) / avg));
+  };
+  return rows
+    .map((row, i) => ({ row, score: words.reduce((n, w) => n + bm25(texts[i], w), 0) }))
+    .filter((r) => r.score > 0)
+    .sort((a, b) => b.score - a.score);
 }
 
-function snippet(text: string, groups: string[][]): string {
+// Rows holding any of the terms; the ranking sorts out which matter.
+function anyWord(words: string[], column: string) {
+  return { where: `(${words.map(() => `${column} LIKE ?`).join(" OR ")})`, params: words.map((w) => `%${w}%`) };
+}
+const MORE = 30; // titles listed past the limit, so an older match is still in sight
+
+function snippet(text: string, words: string[]): string {
   const lower = text.toLowerCase();
-  const at = Math.max(0, Math.min(...groups.flat().map((w) => lower.indexOf(w.toLowerCase())).filter((i) => i >= 0)));
+  const at = Math.max(0, Math.min(...words.map((w) => lower.indexOf(w)).filter((i) => i >= 0)));
   const s = Math.max(0, at - 100);
   return `…${text.slice(s, at + 100).replace(/\s+/g, " ")}…`;
 }
@@ -79,55 +96,79 @@ export function search(db: DatabaseSync, s: Scope, a: SearchArgs): string {
     if (!ms.length) return `${where}还没有整理出摘要。`;
     return `${where === "当前项目" ? "本项目" : where}最新的 ${ms.length} 份摘要（从新到旧）：\n\n${ms.map((m) => sumLine(m, true)).join("\n")}`;
   }
-  const groups = parseQuery(a.query);
+  const words = terms(a.query);
   const out: string[] = [];
   const counts: string[] = [];
+  const rest = (n: number, unit: string) => (n > 0 ? `\n（还有 ${n} ${unit}没列出，换更具体、更少见的词，相关的会排到前面）` : "");
 
-  if (!a.in || a.in === "knowledge") {
-    const km = match(groups, "v.body", null);
+  if (words.length && (!a.in || a.in === "knowledge")) {
+    const km = anyWord(words, "v.body");
     const visible = all ? "1" : s.projectId == null ? "v.scope = 'global'" : "(v.scope = 'global' OR v.project_id = ?)";
+    const vp = visible.includes("?") ? [s.projectId!] : [];
+    const total = (db.prepare(`SELECT COUNT(*) AS n FROM knowledge_versions v WHERE v.void = 0 AND ${visible}`).get(...vp) as { n: number }).n;
     const rows = db.prepare(`SELECT k.code, k.id AS kid, v.version_no, v.status, v.category, v.body, v.reason, v.project_id,
         (SELECT MAX(version_no) FROM knowledge_versions WHERE knowledge_id = k.id AND void = 0) AS latest
       FROM knowledge_versions v JOIN knowledge k ON k.id = v.knowledge_id
-      WHERE v.void = 0 AND ${visible} AND ${km.where} ORDER BY (v.version_no = latest) DESC, k.id, v.version_no DESC LIMIT ?`)
-      .all(...(visible.includes("?") ? [s.projectId!] : []), ...km.params, limit) as any[];
-    counts.push(`${rows.length} 条知识`);
-    if (rows.length)
-      out.push("知识：\n" + rows.map((r) => {
-        const current = r.version_no === r.latest;
-        const label = !current ? "旧版本" : r.status === "archived" ? "已归档" : "当前";
-        const why = current && r.status === "archived" && r.reason ? `（归档原因：${r.reason}）` : "";
-        return `${r.code}${current ? "" : "@" + r.version_no}${tag(r.project_id)}  ${CATEGORY[r.category]} · ${label}  ${r.body}${why}`;
-      }).join("\n"));
+      WHERE v.void = 0 AND ${visible} AND ${km.where} ORDER BY k.id DESC, v.version_no DESC`).all(...vp, ...km.params) as any[];
+    // One line per item (E9 C: one item's seven versions filled seven of ten lines): the current version when it
+    // matches, the other matching versions named after it; otherwise the best matching old one, so "did we once decide X"
+    // is still answered.
+    const byItem = new Map<number, Ranked<any>[]>();
+    for (const r of rank(rows, (r) => r.body, words, total)) byItem.set(r.row.kid, [...(byItem.get(r.row.kid) ?? []), r]);
+    const items = [...byItem.values()].map((vs) => {
+      const shown = vs.find((v) => v.row.version_no === v.row.latest) ?? vs[0];
+      return { ...shown, others: vs.filter((v) => v !== shown).map((v) => v.row.version_no).sort((x, y) => x - y) };
+    }).sort((x, y) => y.score - x.score);
+    counts.push(`${items.length} 条知识`);
+    const line = (r: (typeof items)[number], short: boolean) => {
+      const current = r.row.version_no === r.row.latest;
+      const label = !current ? "旧版本" : r.row.status === "archived" ? "已归档" : "当前";
+      const why = current && r.row.status === "archived" && r.row.reason ? `（归档原因：${r.row.reason}）` : "";
+      const body = short && r.row.body.length > 40 ? r.row.body.slice(0, 40) + "…" : r.row.body;
+      const note = !current ? `（当前版本没有提到这些词，read("${r.row.code}") 看现在的内容）`
+        : r.others.length ? `（旧版本 ${r.others.map((n) => "@" + n).join("、")} 也提到这些词）` : "";
+      return `${r.row.code}${current ? "" : "@" + r.row.version_no}${tag(r.row.project_id)}  ${CATEGORY[r.row.category]} · ${label}  ${body}${short ? "" : why}${short ? "" : note}`;
+    };
+    if (items.length)
+      out.push("知识：\n" + items.slice(0, limit).map((r) => line(r, false)).join("\n")
+        + (items.length > limit ? `\n更多（只列开头）：\n${items.slice(limit, limit + MORE).map((r) => line(r, true)).join("\n")}` : "")
+        + rest(items.length - limit - MORE, "条"));
   }
 
-  if (!a.in || a.in === "summaries") {
-    const sm = match(groups, "(m.title || ' ' || m.tags || ' ' || m.body)", { table: "summaries_fts", key: "m.id" });
+  if (words.length && (!a.in || a.in === "summaries")) {
+    const sm = anyWord(words, "(m.title || ' ' || m.tags || ' ' || m.body)");
+    const total = (db.prepare(`SELECT COUNT(*) AS n FROM summaries m WHERE m.void = 0 AND ${sumScope.sql}`).get(...sumScope.params) as { n: number }).n;
     const ms = db.prepare(`SELECT m.* FROM summaries m LEFT JOIN entries e ON e.id = m.last_entry_id
-      WHERE m.void = 0 AND ${sumScope.sql} AND ${sm.where} ORDER BY ${sm.rank}, e.ts DESC LIMIT ?`)
-      .all(...sumScope.params, ...sm.params, ...sm.rankParams, limit) as Summary[];
-    counts.push(`${ms.length} 份摘要`);
-    if (ms.length) out.push("摘要：\n" + ms.map((m, i) => sumLine(m, i < 3)).join("\n"));
+      WHERE m.void = 0 AND ${sumScope.sql} AND ${sm.where} ORDER BY e.ts DESC`).all(...sumScope.params, ...sm.params) as Summary[];
+    // The title counts twice: it names what the discussion was about.
+    const ranked = rank(ms, (m) => `${m.title} ${m.title} ${m.tags} ${m.body}`, words, total);
+    counts.push(`${ranked.length} 份摘要`);
+    if (ranked.length)
+      out.push("摘要：\n" + ranked.slice(0, limit).map((r, i) => sumLine(r.row, i < 3)).join("\n")
+        + (ranked.length > limit ? `\n更多（只列标题）：\n${ranked.slice(limit, limit + MORE).map((r) => sumLine(r.row, false)).join("\n")}` : "")
+        + rest(ranked.length - limit - MORE, "份"));
   }
 
-  if (!a.in || a.in === "raw") {
-    const em = match(groups, "e.text", { table: "entries_fts", key: "e.id" });
+  if (words.length && (!a.in || a.in === "raw")) {
+    const em = anyWord(words, "e.text");
     const sc = scopeSql(scope, s, "e");
-    const hits = db.prepare(`SELECT e.* FROM entries e WHERE e.status = 'active' AND ${sc.sql} AND ${em.where} ORDER BY ${em.rank}, e.ts DESC LIMIT 500`)
-      .all(...sc.params, ...em.params, ...em.rankParams) as Entry[];
-    counts.push(`${hits.length === 500 ? "500 多" : hits.length} 条原始记录`);
-    if (hits.length) out.push(rawGroups(db, hits, groups, limit, all));
+    const total = (db.prepare(`SELECT COUNT(*) AS n FROM entries e WHERE e.status = 'active' AND ${sc.sql}`).get(...sc.params) as { n: number }).n;
+    const rows = db.prepare(`SELECT e.* FROM entries e WHERE e.status = 'active' AND ${sc.sql} AND ${em.where} ORDER BY e.ts DESC`)
+      .all(...sc.params, ...em.params) as Entry[];
+    const ranked = rank(rows, (e) => e.text, words, total);
+    counts.push(`${ranked.length} 条原始记录`);
+    if (ranked.length) out.push(rawGroups(db, ranked.slice(0, 500).map((r) => r.row), words, limit, all, ranked.length));
   }
 
   if (out.length === 0) {
     const what = a.in === "knowledge" ? "知识" : a.in === "summaries" ? "摘要" : a.in === "raw" ? "原始记录" : "知识、摘要或原始记录";
-    return `没有找到包含"${a.query}"的${what}（范围：${where}）。\n可以换个说法（用 | 一次列出几种）${all ? "" : '，或者用 scope: "all" 搜所有项目'}。`;
+    return `没有找到包含"${a.query}"的${what}（范围：${where}）。\n可以换个说法，或者把几种说法一起写上${all ? "" : '，或者用 scope: "all" 搜所有项目'}。`;
   }
   return `找到 ${counts.join("、")}。\n\n${out.join("\n\n")}`;
 }
 
 // Raw hits grouped under the summary that cites them, else under the run that processed them (4.7).
-function rawGroups(db: DatabaseSync, hits: Entry[], words: string[][], limit: number, all: boolean): string {
+function rawGroups(db: DatabaseSync, hits: Entry[], words: string[], limit: number, all: boolean, total: number): string {
   const runSummaries = new Map<number, Summary[]>();
   const ofRun = (run: number) => {
     if (!runSummaries.has(run)) runSummaries.set(run, db.prepare("SELECT * FROM summaries WHERE run_id = ? AND void = 0 ORDER BY id").all(run) as Summary[]);
@@ -152,12 +193,12 @@ function rawGroups(db: DatabaseSync, hits: Entry[], words: string[][], limit: nu
   const shown = [...groups.values()].slice(0, limit).map((g) => {
     const lines = g.items.slice(0, 2).map((e) => `    ${addr(e)} ${ROLE[e.role]}  ${localTime(e.ts)}  ${snippet(e.text, words)}`);
     const rest = g.items.length - 2;
-    if (rest > 0) lines.push(g.cited ? `    （另有 ${rest} 条。想看这段讨论的全貌，read("${g.cited.code}")；只找某个细节，就缩小关键词。）` : `    （另有 ${rest} 条）`);
+    if (rest > 0) lines.push(g.cited ? `    （另有 ${rest} 条。想看这段讨论的全貌，read("${g.cited.code}")；只找某个细节，就换更具体的词。）` : `    （另有 ${rest} 条）`);
     const head = g.head.replace("没被任何摘要讲到的原始记录", `没被任何摘要讲到的原始记录 ${g.items.length} 条`);
     return `▸ ${g.cited ? `${head}（${g.items.length} 条）` : head}\n${lines.join("\n")}`;
   });
-  const more = groups.size > limit ? `\n\n（还有 ${groups.size - limit} 组没列出，可以缩小关键词）` : "";
-  return `原始记录 ${hits.length} 条，按所在的讨论分组：\n\n${shown.join("\n\n")}${more}`;
+  const more = groups.size > limit ? `\n\n（还有 ${groups.size - limit} 组没列出，可以换更具体的词）` : "";
+  return `原始记录 ${total} 条，${total > hits.length ? `相关度最高的 ${hits.length} 条` : ""}按所在的讨论分组：\n\n${shown.join("\n\n")}${more}`;
 }
 
 function attribution(db: DatabaseSync, e: Entry): string {
@@ -183,7 +224,7 @@ export function read(db: DatabaseSync, s: Scope, address: string, full = false):
       const path = (db.prepare("SELECT transcript_path AS p FROM sessions WHERE id = ?").get(e.session_id) as { p: string }).p;
       const row = existsSync(path) ? parseTranscript(path).find((r) => r.uuid === e.cc_uuid) : undefined;
       if (row) body = fullText(row);
-      else note = "这条记录的未裁剪原文已经不在了：Claude Code 按设置自动清理了这个会话的记录文件。下面是保存下来的裁剪版：\n\n";
+      else note = "这条记录的未裁剪原文已经没有了，下面是保存下来的裁剪版：\n\n";
     }
     let before = "";
     // "可以" alone means nothing; the proposal it answers is at the end of Claude's previous reply (4.7).

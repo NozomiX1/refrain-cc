@@ -17,7 +17,7 @@
 你和 CC 对话
   │ 每轮结束：新内容攒够 2 万字？
   ▼
-书记员（后台子 agent，Haiku，推理强度 low）
+书记员（后台子 agent，Haiku，推理强度 high）
   │ 读这批对话 + 已有的知识、摘要、现状 → 交一份整理结果 → 校验不过就退回重交
   ▼
 ~/.refrain/memory.db：知识（带版本和出处）、摘要、现状、原文索引
@@ -39,7 +39,7 @@
 在 CC 里：
 
 ```
-/plugin install refrain --marketplace NozomiX1/refrain
+/plugin install refrain --marketplace NozomiX1/refrain-cc
 ```
 
 按提示添加 marketplace（`y`），选一个作用域。配套的 `refrain-timer`（负责空闲压缩）会作为依赖一起装上。
@@ -93,7 +93,7 @@ printf '%s\n' "$out${seg:+ | $seg}"
 
 ## 花费
 
-书记员和你的前台会话**共用同一份订阅额度**（或 API 账单）。参考：Haiku 整理一次约 $0.015（只算输入、缓存写入和输出，订阅额度大致这么扣），整理两天的密集讨论约 $0.2。状态栏里的 `≈$` 是按 API 价折算的，含缓存读取，和订阅额度不是一回事，见 [design.md 8.3](docs/design.md)。
+书记员和你的前台会话**共用同一份订阅额度**（或 API 账单）。参考：Haiku（推理强度 high）整理一次约 $0.02（只算输入、缓存写入和输出，订阅额度大致这么扣），整理五天的密集讨论约 $1.5。状态栏里的 `≈$` 是按 API 价折算的，含缓存读取，和订阅额度不是一回事，见 [design.md 8.3](docs/design.md)。
 
 ## 数据和隐私
 

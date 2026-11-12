@@ -32,7 +32,7 @@ export type Entry = {
 
 type Block = { type?: string; text?: string; name?: string; id?: string; input?: Record<string, unknown>; tool_use_id?: string; content?: unknown; is_error?: boolean };
 
-export const LIMITS = { assistant: 4000, toolHead: 200, toolTail: 200, inputHead: 250, inputTail: 50, pasteHead: 300, pasteTail: 200 };
+export const LIMITS = { assistant: 4000, toolHead: 200, toolTail: 200, inputHead: 150, inputTail: 50, pasteHead: 300, pasteTail: 200 };
 
 export function parseTranscript(path: string): Row[] {
   const rows: Row[] = [];
@@ -118,10 +118,10 @@ function renderCommand(t: string): string {
   return args ? `${name} ${args}` : name;
 }
 
+// Every field on its own line, each value clipped alike: one rule for every tool, MCP ones included. Picking one
+// field dropped Bash's description and all that Write and Edit wrote (E12).
 function inputBrief(input: Record<string, unknown> = {}): string {
-  for (const k of ["command", "file_path", "pattern", "url", "query", "description", "prompt"])
-    if (k in input) return clip(String(input[k]), LIMITS.inputHead, LIMITS.inputTail);
-  return clip(JSON.stringify(input), LIMITS.inputHead, LIMITS.inputTail);
+  return Object.entries(input).map(([k, v]) => `\n${k}: ${clip(typeof v === "string" ? v : JSON.stringify(v), LIMITS.inputHead, LIMITS.inputTail)}`).join("");
 }
 
 function resultText(b: Block): string {

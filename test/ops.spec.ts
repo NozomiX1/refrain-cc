@@ -46,7 +46,7 @@ test("three failures in a row pause the session; resume clears the count", () =>
   resume(db, 1);
   const p = prep();
   assert.equal(p.status, "ready", "a resumed session runs again");
-  assert.ok(submit(db, home, p.runId, { summaries: [{ title: "测试", body: "测试用的摘要。", refs: ["S1/T1#E1"] }], knowledge: [], project_state: null, session_state: null }).ok);
+  assert.ok(submit(db, home, p.runId, { summaries: [{ title: "测试", body: "测试用的摘要。", refs: ["S1/T1#E1"] }], knowledge: [], state: null }).ok);
   assert.equal(status().state, "idle");
   assert.equal(status().costUsd, 0.0015, "the failed runs' tokens still count");
 });
@@ -76,7 +76,7 @@ test("the panel shows the briefing and how the scribe is doing", () => {
   const { home, db, t, path, prep } = setup();
   t.human("以后先讨论再动手");
   const p = prep();
-  submit(db, home, p.runId, { summaries: [{ title: "测试", body: "测试用的摘要。", refs: ["S1/T1#E1"] }], project_state: null, session_state: null, knowledge: [
+  submit(db, home, p.runId, { summaries: [{ title: "测试", body: "测试用的摘要。", refs: ["S1/T1#E1"] }], state: null, knowledge: [
     { op: "create", scope: "global", category: "rule", about_me: true, epistemic: "quote", pending: false, body: "先讨论再动手。", refs: ["S1/T1#E1"], reason: "用户说的" }] });
   t.human("下一件事");
   t.write(path);

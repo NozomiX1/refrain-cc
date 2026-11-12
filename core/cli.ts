@@ -28,7 +28,7 @@ function where(db: DatabaseSync, a: { ccSessionId: string; cwd: string }) {
 
 const commands: Record<string, () => unknown> = {
   prepare: () => prepare(db, home, args),
-  submit: () => submit(db, home, args.runId, args.submission),
+  submit: () => submit(db, home, args.runId, args.submission, args.looked ?? true),
   finish: () => finish(db, home, args.runId, args.usage, args.error),
   info: () => ({ home }),
   enable: () => {
@@ -47,8 +47,8 @@ const commands: Record<string, () => unknown> = {
   },
   handoff: () => {
     const w = where(db, args);
-    const h = handoff(db, w.sessionId, w.transcriptPath ?? (w.sessionId ? findTranscript(args.ccSessionId) : null), args.instructions);
-    log(home, "compact", { session: w.sessionId, trigger: args.trigger, ...(h.status === "ok" ? { chars: h.text.length, tailTurns: h.tail.turns } : { native: h.reason }) });
+    const h = handoff(db, w.sessionId, w.transcriptPath ?? (w.sessionId ? findTranscript(args.ccSessionId) : null), args.instructions, args.trigger);
+    log(home, "compact", { session: w.sessionId, trigger: args.trigger, ...(h.status === "ok" ? { chars: h.text.length, tailTurns: h.tail.turns } : h.status === "skip" ? { skip: h.notice } : { native: h.reason }) });
     return h;
   },
   resume: () => {

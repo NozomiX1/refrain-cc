@@ -29,7 +29,8 @@ search 和 read 设为始终可见（isDeferred: false，7.4）；说明各自�
 - 只在答案会改变你下一步怎么做时才查。不要把结果里列出的地址逐个打开。
 
 怎么查：
-- 关键词按字面匹配，不区分大小写；只匹配内容，项目名不参与匹配。空格分开表示都要出现："代理 端口"；| 分开表示任一个就算："登录|login|鉴权"。同一件事可能有几种说法（中英文、改名前后的叫法），用 | 一次列出来。
+- 写下原文里可能出现的词，或者直接写一句话："代理端口""之前那台服务器的配置"。按字面匹配，不区分大小写，只匹配内容，项目名不参与匹配；怎么分隔都可以，不需要特别的格式。结果按相关程度排：用到的词越多、越少见，排得越前，只中了一部分的也会列出。同一件事可能有几种说法（中英文、改名前后的叫法、近义词），一起写上："登录 login 鉴权"，多写只会让结果更全。
+- 结果多时，前面的列全文，后面的只列标题或开头，再多的写明还有几条。要找的东西可能就在后面的标题里。
 - 不填 query，就按时间列出最新的摘要，用来回答"最近做了什么"。
 - 没搜到不代表没发生过：换个说法再搜，或者扩大 scope。
 - 每条结果都带时间。同一件事有几份摘要时，以时间靠后的为准：前面写着"未确认""待定"的，后面可能已经定了。
@@ -39,8 +40,8 @@ search 和 read 设为始终可见（isDeferred: false，7.4）；说明各自�
 
 这些记忆由后台整理，Claude 不能直接修改，也不要用 Edit、Write 去改 ~/.refrain/ 下的文件（会被拒绝）。
 - 用户让你"记住"某件事时，不需要写任何文件（包括 Claude Code 自带的记忆文件），后台会从对话里把它整理进记忆，简单确认即可。用户明确要求写进某个文件（比如 CLAUDE.md）时，照他说的做。
-- 用户要求修改、删除或恢复某条记忆时：先用 read 读出这条的当前内容，在同一条回复里念给用户核对，并告诉用户"已记下，接下来后台整理时会按你的话更新（一般在几轮对话之内）"。用户只纠正了一部分时，复述你理解的改法。
-- 能做到的有限，答应用户时要如实说：摘要和原始对话改不了（写错的摘要，后台会补一份更正）；归档的知识不再出现在记忆块里，但仍能被检索到；密码、密钥这类凭据不会被记住。用户说"这个别记"时，后台不会写进记忆，但原始对话里仍有。用户的这句话本身就会被整理进去。
+- 用户要求修改、删除或恢复某条记忆时：先用 read 读出这条的当前内容，在同一条回复里念给用户核对，并告诉用户"已记下，之后后台整理时会按你的话更新"。用户只纠正了一部分时，复述你理解的改法。
+- 能做到的有限，答应用户时要如实说：摘要和原始对话改不了（写错的摘要，后台会补一份更正）；归档的知识不再出现在记忆块里，但仍能被检索到；密码、密钥这类凭据不会被记住。用户说"这个别记"时，后台不会把那件事写进记忆，但原始对话里仍有，能被检索到。
 ```
 
 **inputSchema：**
@@ -49,7 +50,7 @@ search 和 read 设为始终可见（isDeferred: false，7.4）；说明各自�
 {
   "type": "object",
   "properties": {
-    "query": { "type": "string", "description": "关键词。空格表示都要出现，| 表示任一个就算。不填就按时间列出最新的摘要。" },
+    "query": { "type": "string", "description": "原文里可能出现的词，或者一句话；几种说法可以一起写上。结果按相关程度排。不填就按时间列出最新的摘要。" },
     "in": { "type": "string", "enum": ["summaries", "raw", "knowledge"], "description": "只搜某一类。不填就三类都搜。" },
     "scope": { "type": "string", "enum": ["session", "project", "all"], "description": "session 只搜当前会话，project 搜当前项目（默认；不在任何项目里时，指那些同样不属于任何项目的会话），all 搜所有项目（结果会标出每条来自哪个项目）。只在明确需要别的项目的内容时用 all。" },
     "limit": { "type": "integer", "description": "最多返回多少条，默认 10。" }
@@ -92,9 +93,10 @@ search 和 read 设为始终可见（isDeferred: false，7.4）；说明各自�
 
 ```
 仅供后台整理使用。和用户对话时一律不要调用，包括用户让你记住或整理记忆的时候。
-提交这次整理的全部结果：摘要、对知识的操作、新的项目现状和本会话现状。格式和每个字段的写法见你的系统提示。
+提交这次整理的全部结果：摘要、对知识的操作、对现状的操作。格式和每个字段的写法见你的系统提示。
 每次整理都必须调用一次。至少要有一份摘要；知识没有改动就交空列表，现状没有变化就交 null。
 提交后会检查内容；不通过时会逐条列出问题，改好后整份重新提交，最多 3 次。
+这次整理一次都没有用 search 或 read 时，第一次通过检查的提交会先停下，问你要不要查；不需要的话，只交 {"confirm": true}，就会保存那一份。
 ```
 
 **inputSchema：**
@@ -136,50 +138,32 @@ search 和 read 设为始终可见（isDeferred: false，7.4）；说明各自�
         "required": ["op", "refs", "reason"]
       }
     },
-    "project_state": { "$ref": "#/$defs/state" },
-    "session_state": { "$ref": "#/$defs/state" }
-  },
-  "required": ["summaries", "knowledge", "project_state", "session_state"],
-  "$defs": {
     "state": {
       "oneOf": [
         { "type": "null" },
         {
-          "type": "object",
-          "properties": {
-            "items": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "properties": {
-                  "from": { "type": "integer" },
-                  "type": { "type": "string", "enum": ["phase", "progress", "todo", "verify", "authorization", "instruction"] },
-                  "content": { "type": "string" },
-                  "condition": { "type": ["string", "null"] },
-                  "refs": { "type": "array", "items": { "type": "string" } }
-                }
-              }
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "op": { "type": "string", "enum": ["keep", "update", "close", "create"] },
+              "no": { "type": "integer", "description": "上一版的序号；create 不写" },
+              "type": { "type": "string", "enum": ["phase", "progress", "todo", "verify", "instruction"] },
+              "body": { "type": "string" },
+              "condition": { "type": ["string", "null"] },
+              "refs": { "type": "array", "items": { "type": "string" } },
+              "outcome": { "type": "string", "enum": ["done", "abandoned", "promoted"] },
+              "reason": { "type": "string" },
+              "to": { "type": "string" }
             },
-            "closed": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "properties": {
-                  "no": { "type": "integer" },
-                  "outcome": { "type": "string", "enum": ["done", "abandoned", "promoted"] },
-                  "reason": { "type": "string" },
-                  "to": { "type": "string" }
-                },
-                "required": ["no", "outcome"]
-              }
-            }
-          },
-          "required": ["items", "closed"]
+            "required": ["op"]
+          }
         }
       ]
-    }
+    },
+    "confirm": { "type": "boolean", "description": "只在提交停下来问你要不要查以前的记录、而你确认不需要时用：只写 {\"confirm\": true}，保存刚才那份。" }
   }
 }
 ```
 
-按 op 不同的必填字段（create 要 scope、category 等，update 要 code、body，archive 要 code），以及现状每一项的 type、content（原样保留的项只写 from，所以 schema 里不能设成必填），由校验代码检查，不写进 schema，免得 schema 太复杂；出错时回执里会写清楚缺了什么。
+按 op 不同的必填字段（知识：create 要 scope、category 等，update 要 code、body，archive 要 code；现状：keep 只要 no，update 要 no、body，close 要 no、outcome，create 要 type、body），由校验代码检查，不写进 schema；三个顶层字段也不设成必填，因为确认时只交 `confirm`，缺了哪个由校验代码在回执里写明，免得 schema 太复杂；出错时回执里会写清楚缺了什么。

@@ -10,10 +10,12 @@ type Options = { idleCompaction: boolean; idleMinTokens: number; scribeMinChars:
 // Scribe agent id -> run id. shortcut: lost on a module reload; that run then times out (4.3 step 1) and the next turn retries.
 const runs = new Map<string, number>();
 const scribes = new Set<string>(); // every scribe agent id of this session: their end notices are dropped
+const looked = new Set<string>(); // scribe agents that called search or read: a submit without either is held once (4.3)
 let home = ""; // the data dir, from core, so the write guard matches what core uses
 let enabled = false; // false when node is missing or too old: refrain stays out of the way (7.3)
 let panelText = "";
 const toldOnce = new Set<string>(); // one-time notices of this session (7.11)
+let compacted = ""; // the line an idle compaction leaves, written once the compacted conversation is up
 
 async function core($: any, cmd: string, args: object): Promise<any> {
   const r = await $.process.run(["node", `${$.plugin.root}/core/cli.ts`, cmd], { stdin: JSON.stringify(args), timeoutMs: 60000 });
@@ -53,6 +55,14 @@ async function said($: any, lead: string): Promise<string> {
   return md.slice(md.indexOf(lead)).match(/```\n([\s\S]*?)\n```/)?.[1] ?? "";
 }
 
+// Kept by handle, a reply is written again under its original message id and a tool result linked to the original
+// call, and --resume then doubles the reply and walks back past the compaction (e11; CC #99727, #105781). Those two
+// are rebuilt from what the hook sees, losing their thinking (dropped after a compaction anyway) and images in tool
+// results. The person's own messages have neither problem and keep their handle, images included. A reply that was
+// only thinking would come back as "(no content)", so it is left out.
+const fresh = (m: any) =>
+  m.role === "user" && !m.toolResults?.length ? m : { role: m.role, text: m.text, toolUses: m.toolUses ?? [], ...(m.toolResults && { toolResults: m.toolResults }) };
+
 // Where the kept tail starts in e.messages: the n-th user turn from the end, checked against the text core expects.
 function tailStart(msgs: any[], turns: number, firstText: string): number {
   const norm = (s: string) => s.replace(/〔图片〕/g, "").replace(/\s+/g, "").slice(0, 200);
@@ -88,7 +98,7 @@ export const register: Register = (on, options) => {
       prompt: await doc($, "scribe-system.md"),
       tools: [TOOLS.search, TOOLS.read, TOOLS.submit],
       model: opt.scribeModel ?? "haiku",
-      effort: "low", // E7: Haiku low scored as well as Sonnet medium; the user's own default (often xhigh) would apply otherwise
+      effort: "high", // E8: high kept every core item low lost (8/8 vs 5/8) at about twice the quota; unset, the user's own default (often xhigh) applies
       omitClaudeMd: true,
       background: true,
     });
@@ -136,6 +146,10 @@ export const register: Register = (on, options) => {
   // Not gated on `enabled`: SessionStart may run before session.start has finished; a missing node just fails here.
   on("classic.SessionStart", async ($, e: any, next) => {
     const r: any = await next(e);
+    if (e.source === "compact" && compacted) {
+      $.ui.log(compacted);
+      compacted = "";
+    }
     if (e.source === "resume" || e.source === "fork") return r;
     try {
       const { text } = await core($, "briefing", await here($));
@@ -158,10 +172,13 @@ export const register: Register = (on, options) => {
     }
     try {
       const h = await core($, "handoff", { ...(await here($)), instructions: e.instructions, trigger: e.trigger });
+      // Nothing to gain: the person sees why, and CC does not summarise in our place (4.4).
+      if (h.status === "skip") return { skip: h.notice };
       if (h.status !== "ok") return next(e);
       const from = tailStart(e.messages, h.tail.turns, h.tail.firstText);
       if (from < 0) throw new Error("kept tail not found in the messages");
-      return { messages: [{ role: "user", text: h.text, toolUses: [] }, ...e.messages.slice(from)] };
+      compacted = h.notice ?? "";
+      return { messages: [{ role: "user", text: h.text, toolUses: [] }, ...e.messages.slice(from).filter((m: any) => m.role === "user" || m.text || m.toolUses?.length).map(fresh)] };
     } catch (err) {
       await failed($, "session.compact", err);
       once($, "handoff", "这次没能接管压缩，交给了 CC 原生的压缩。记忆没有受影响。");
@@ -171,6 +188,7 @@ export const register: Register = (on, options) => {
 
   // search and read errors go back to the model as the tool's result, never as a thrown hook (7.12).
   on("tool.call", { tool: TOOLS.search }, async ($, e: any) => {
+    if (e.agentId && runs.has(e.agentId)) looked.add(e.agentId);
     const { query, in: kind, scope, limit } = e;
     try {
       return { result: (await core($, "search", { ...(await here($)), args: { query, in: kind, scope, limit } })).text };
@@ -181,6 +199,7 @@ export const register: Register = (on, options) => {
   });
 
   on("tool.call", { tool: TOOLS.read }, async ($, e: any) => {
+    if (e.agentId && runs.has(e.agentId)) looked.add(e.agentId);
     try {
       return { result: (await core($, "read", { ...(await here($)), address: e.address, full: e.full })).text };
     } catch (err) {
@@ -193,8 +212,8 @@ export const register: Register = (on, options) => {
   on("tool.call", { tool: TOOLS.submit }, async ($, e: any) => {
     const runId = e.agentId ? runs.get(e.agentId) : undefined;
     if (runId === undefined) return { deny: await said($, "主模型调用 submit") };
-    const { summaries, knowledge, project_state, session_state } = e;
-    const r = await core($, "submit", { runId, submission: { summaries, knowledge, project_state, session_state } });
+    const { summaries, knowledge, state, confirm } = e;
+    const r = await core($, "submit", { runId, looked: looked.has(e.agentId), submission: { summaries, knowledge, state, confirm } });
     return r.ok ? { result: r.text } : { deny: r.text };
   });
 
@@ -235,7 +254,7 @@ export const register: Register = (on, options) => {
       const p = await core($, "prepare", {
         ...(await here($)),
         minChars: opt.scribeMinChars,
-        idle: { enabled: opt.idleCompaction ?? true, minTokens: opt.idleMinTokens ?? 60000 },
+        idle: { enabled: opt.idleCompaction ?? true, minTokens: opt.idleMinTokens ?? 150000 },
       });
       if (p.reason === "paused") once($, "paused", "这个会话的自动整理已暂停（书记员连续失败 3 次）。看原因用 /refrain，恢复用 /refrain resume。");
       if (p.status !== "ready") return r;

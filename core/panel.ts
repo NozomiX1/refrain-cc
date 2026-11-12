@@ -3,7 +3,7 @@
 import { existsSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
 import { consecutiveFailures, PAUSE_AFTER, runCost } from "./ops.ts";
-import { briefing, currentKnowledge, localDate, localTime } from "./render.ts";
+import { briefing, currentKnowledge, localDate, localTime, TOKENS_PER_CHAR } from "./render.ts";
 import { readSession } from "./transcript.ts";
 
 export const BUDGET = { global: 4000, project: 15000 }; // reminder lines in tokens, not limits (5.5)
@@ -38,7 +38,8 @@ export function panel(db: DatabaseSync, w: Where): string {
   const weekAgo = new Date(Date.now() - 7 * 86400000).toISOString();
   lines.push(`- 书记员的花费（折算成 API 价格）：本会话 ${dollars(cost((r) => r.session_id === w.sessionId))}，今天 ${dollars(cost((r) => localDate(r.started_at) === today))}，近 7 天 ${dollars(cost((r) => r.started_at >= weekAgo))}`);
   const live = currentKnowledge(db).filter((k) => k.status === "active");
-  const tok = (ks: typeof live) => (db.prepare(`SELECT COALESCE(SUM(tokens), 0) AS t FROM knowledge_versions WHERE id IN (${ks.map((k) => k.version_id).join(",") || "0"})`).get() as { t: number }).t;
+  // From the text, not the stored estimate: rows written before 11-12 counted 0.65 per character.
+  const tok = (ks: typeof live) => Math.ceil(ks.reduce((n, k) => n + k.body.length, 0) * TOKENS_PER_CHAR);
   const g = tok(live.filter((k) => k.scope === "global"));
   const p = w.projectId == null ? 0 : tok(live.filter((k) => k.scope === "project" && k.project_id === w.projectId));
   const over = (n: number, cap: number) => (n > cap ? "，超过提醒线了，可以考虑让书记员合并一下" : "");

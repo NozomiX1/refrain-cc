@@ -5,10 +5,10 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { bookmark, ensureProject, ensureSession, failRun, finishRun, now, pending, startRun, tx, type Numbered } from "./db.ts";
-import { contextAt, TOKENS_PER_CHAR } from "./handoff.ts";
-import { consecutiveFailures, PAUSE_AFTER, writeStatus, type TurnInfo } from "./ops.ts";
+import { contextAt, sizes } from "./handoff.ts";
+import { consecutiveFailures, PAUSE_AFTER, statusTurn, writeStatus, type TurnInfo } from "./ops.ts";
 import { projectRoot } from "./project.ts";
-import { briefing, localDate, scribeInput, summariesBlock } from "./render.ts";
+import { localDate, scribeInput } from "./render.ts";
 import { apply, LIMITS as SUBMIT, rejection, validate, type Ctx, type Submission } from "./submit.ts";
 import { effectivePath, parseTranscript, toEntries, type Row } from "./transcript.ts";
 
@@ -75,7 +75,7 @@ export function prepare(db: DatabaseSync, home: string, a: PrepareArgs): { statu
   const today = a.today ?? localDate(new Date());
   // The single-writer lock is a running row, taken under an immediate transaction (ADR-0018).
   if (consecutiveFailures(db, sessionId) >= PAUSE_AFTER) {
-    writeStatus(db, home, sessionId, "paused", turnInfo(db, rows, sessionId, projectId, root, a.idle));
+    writeStatus(db, home, sessionId, "paused", turnInfo(db, rows, sessionId, a.idle));
     return { status: "skip", reason: "paused" };
   }
   const out = tx(db, () => {
@@ -99,60 +99,88 @@ export function prepare(db: DatabaseSync, home: string, a: PrepareArgs): { statu
     return { status: "skip" as const, reason: p.entries.length ? `only ${size} new chars` : "nothing new", warnings };
   }, "IMMEDIATE");
   // A leftover run belongs to the other session; this session's status line keeps showing its own scribe.
-  writeStatus(db, home, sessionId, out.status === "ready" && !("leftoverOf" in out) ? "running" : undefined, turnInfo(db, rows, sessionId, projectId, root, a.idle));
+  writeStatus(db, home, sessionId, out.status === "ready" && !("leftoverOf" in out) ? "running" : undefined, turnInfo(db, rows, sessionId, a.idle));
   return out;
 }
 
 const usageOf = (r: Row) => (r as { message?: { usage?: Record<string, any> } }).message?.usage;
 
-// Context size and cache lifetime from the latest request's usage; the handoff's size is estimated as
-// summaries plus briefing plus the tail, the tail being how much the context grew since the bookmark.
-function turnInfo(db: DatabaseSync, rows: Row[], sessionId: number, projectId: number | null, root: string | null, idle = { enabled: true, minTokens: 60000 }): TurnInfo {
-  const mark = bookmark(db, sessionId);
-  const markLine = mark ? rows.find((r) => r.uuid === mark)?.line ?? -1 : -1;
-  const atMark = markLine < 0 ? 0 : contextAt(rows, markLine);
-  const words = summariesBlock(db, sessionId).length + briefing(db, { projectId, projectPath: root, sessionId }).length;
+// Context size and cache lifetime from the latest request's usage; the rest from what a compaction would do now.
+function turnInfo(db: DatabaseSync, rows: Row[], sessionId: number, idle = { enabled: true, minTokens: 150000 }, turnEndedAt = new Date().toISOString()): TurnInfo {
+  const s = sizes(db, sessionId, rows);
   // A request that only read the cache says nothing about its lifetime; look back to the last one that wrote it.
   const wrote = rows.findLast((r) => { const c = usageOf(r)?.cache_creation; return r.type === "assistant" && c && (c.ephemeral_1h_input_tokens || c.ephemeral_5m_input_tokens); });
   const oneHour = (usageOf(wrote ?? ({} as Row))?.cache_creation?.ephemeral_1h_input_tokens ?? 0) > 0;
   // REFRAIN_IDLE_TTL_MS and REFRAIN_IDLE_MIN_TOKENS let scripted tests reach an idle compaction in minutes.
   const env = process.env;
-  const context = contextAt(rows);
   return {
-    turnEndedAt: new Date().toISOString(),
-    contextTokens: context,
+    turnEndedAt,
+    contextTokens: s?.context ?? contextAt(rows),
     cacheTtlMs: env.REFRAIN_IDLE_TTL_MS ? Number(env.REFRAIN_IDLE_TTL_MS) : oneHour ? 3600000 : 300000,
-    handoffTokens: Math.ceil(words * TOKENS_PER_CHAR) + Math.max(0, context - atMark),
+    handoffTokens: s?.handoffTokens ?? 0,
+    worth: s?.worth ?? false,
+    pendingTurns: s?.pendingTurns ?? 0,
+    pendingTokens: s?.pendingTokens ?? 0,
     idle: env.REFRAIN_IDLE_MIN_TOKENS ? { ...idle, minTokens: Number(env.REFRAIN_IDLE_MIN_TOKENS) } : idle,
   };
 }
 
-export function submit(db: DatabaseSync, home: string, runId: number, s: Submission): { ok: boolean; text: string } {
+// E9 C: where an earlier record was needed, the scribe searched in 3 of 9 runs. So a valid submission made without any
+// search or read is held once and the checklist goes back: {"confirm": true} saves it as it was, a full resubmission
+// replaces it. Held work is never lost: it is saved if the scribe stops there or uses up its tries. E12: after looking,
+// 4 of 13 resent the same submission whole; the checklist now says that needs only the confirm too.
+export const CHECKLIST = `这次整理还没有查过以前的记录，提交先不保存。对照一下这一批里有没有下面几种情况：
+- 用户的一次性要求（"先讨论""先别动手""这次别提交"）：以前在别的事情上也说过的，要写成推断类规则；
+- 改主意、推翻以前的做法，或者重新提起以前放下的事：对应的知识可能已经归档，你看不到；
+- 看不懂的指代（"之前那台""最早那版""上次说的那个"），或者你在摘要里写了"没有说明""不清楚指什么"：答案多半在以前的摘要里；
+- 用户纠正某条记忆：先 read 那一条，看原来写的是什么。
+有的话，先用 search 或 read 查，查完要改的，整份重新提交。都没有，或者查完不用改的，调用 submit 并只写 {"confirm": true}，会原样保存刚才那份，不用把同样的内容再交一遍。这一步不算提交次数。`;
+const heldKey = (runId: number) => `held:${runId}`;
+
+// `looked`: the scribe called search or read in this run; callers that do not track it count as having looked.
+export function submit(db: DatabaseSync, home: string, runId: number, sub: Submission & { confirm?: boolean }, looked = true): { ok: boolean; text: string } {
   const run = db.prepare("SELECT session_id, status, attempts, request FROM runs WHERE id = ?").get(runId) as
     | { session_id: number; status: string; attempts: number; request: string }
     | undefined;
   if (!run || run.status !== "running") return { ok: false, text: "这次整理已经结束了，不用再提交。" };
+  const held = (db.prepare("SELECT value FROM meta WHERE key = ?").get(heldKey(runId)) as { value: string } | undefined)?.value;
+  if (sub?.confirm === true && !held) return { ok: false, text: "没有等你确认的提交。请整份提交。" };
+  const s: Submission = sub?.confirm === true ? JSON.parse(held!) : sub;
   const req = JSON.parse(run.request) as Request;
   const ctx: Ctx = { db, sessionId: run.session_id, projectId: req.projectId, batch: req.batch, today: req.today };
   const attempts = run.attempts + 1;
   db.prepare("UPDATE runs SET attempts = ? WHERE id = ?").run(attempts, runId);
   const errs = validate(ctx, s);
   if (errs.length) {
-    if (attempts >= SUBMIT.attempts) {
-      failRun(db, runId, `submit rejected ${attempts} times`);
-      settle(db, home, run.session_id);
-    }
-    return { ok: false, text: rejection(errs, SUBMIT.attempts - attempts) };
+    if (attempts < SUBMIT.attempts) return { ok: false, text: rejection(errs, SUBMIT.attempts - attempts) };
+    if (held) return save(db, home, runId, run.session_id, ctx, JSON.parse(held), `这次提交有 ${errs.length} 处问题，已经交了 ${SUBMIT.attempts} 次，改为保存你之前通过检查的那一份。`);
+    failRun(db, runId, `submit rejected ${attempts} times`);
+    settle(db, home, run.session_id);
+    return { ok: false, text: rejection(errs, 0) };
   }
-  let text = "";
-  finishRun(db, runId, run.session_id, req.batch, { response: JSON.stringify(s) }, (ids) => (text = apply(ctx, s, runId, ids)));
-  settle(db, home, run.session_id);
-  return { ok: true, text };
+  if (!looked && !held) {
+    db.prepare("UPDATE runs SET attempts = ? WHERE id = ?").run(run.attempts, runId);
+    db.prepare("INSERT INTO meta (key, value) VALUES (?, ?)").run(heldKey(runId), JSON.stringify(s));
+    return { ok: false, text: CHECKLIST };
+  }
+  return save(db, home, runId, run.session_id, ctx, s);
 }
 
-// After a run ends: idle again, or paused once it is the third failure in a row.
+function save(db: DatabaseSync, home: string, runId: number, sessionId: number, ctx: Ctx, s: Submission, note = ""): { ok: boolean; text: string } {
+  let text = "";
+  finishRun(db, runId, sessionId, ctx.batch, { response: JSON.stringify(s) }, (ids) => (text = apply(ctx, s, runId, ids)));
+  db.prepare("DELETE FROM meta WHERE key = ?").run(heldKey(runId));
+  settle(db, home, sessionId);
+  return { ok: true, text: note ? `${note}\n${text}` : text };
+}
+
+// After a run ends: idle again, or paused once it is the third failure in a row. The turn's numbers are redone: the run
+// moved the bookmark, so refrain-timer would otherwise skip a compaction that is now worth it.
 function settle(db: DatabaseSync, home: string, sessionId: number) {
-  writeStatus(db, home, sessionId, consecutiveFailures(db, sessionId) >= PAUSE_AFTER ? "paused" : "idle");
+  const old = statusTurn(db, home, sessionId);
+  const path = (db.prepare("SELECT transcript_path AS p FROM sessions WHERE id = ?").get(sessionId) as { p: string }).p;
+  const turn = old && existsSync(path) ? turnInfo(db, parseTranscript(path), sessionId, old.idle, old.turnEndedAt) : undefined;
+  writeStatus(db, home, sessionId, consecutiveFailures(db, sessionId) >= PAUSE_AFTER ? "paused" : "idle", turn);
 }
 
 // Called when the scribe subagent's turn ends: a run that never got a valid submit has failed (4.3).
@@ -160,6 +188,10 @@ export function finish(db: DatabaseSync, home: string, runId: number, usage?: un
   if (usage != null) db.prepare("UPDATE runs SET usage = ? WHERE id = ?").run(JSON.stringify(usage), runId);
   const r = db.prepare("SELECT status, session_id FROM runs WHERE id = ?").get(runId) as { status: string; session_id: number } | undefined;
   if (!r) return { status: "missing", paused: false };
+  if (r.status === "running" && db.prepare("SELECT 1 FROM meta WHERE key = ?").get(heldKey(runId))) {
+    submit(db, home, runId, { confirm: true });
+    return { status: "succeeded", paused: false };
+  }
   if (r.status === "running") failRun(db, runId, error);
   settle(db, home, r.session_id);
   return { status: r.status === "running" ? "failed" : r.status, paused: consecutiveFailures(db, r.session_id) >= PAUSE_AFTER };

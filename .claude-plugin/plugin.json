@@ -20,7 +20,7 @@
       "type": "number",
       "title": "空闲压缩的上文下限（token）",
       "description": "上文小于这个数时不做空闲压缩：能省的不多，却要把原文换成摘要。",
-      "default": 60000
+      "default": 150000
     },
     "scribeMinChars": {
       "type": "number",
